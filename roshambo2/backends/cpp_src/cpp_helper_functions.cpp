@@ -22,8 +22,21 @@
 
 #include <array>
 #include <cmath>
+#include <iostream>
 
 using DTYPE = float;
+
+////////////////////////////////////////////////////////////////////////////////
+/// For debug
+////////////////////////////////////////////////////////////////////////////////
+
+template<typename T, size_t N>
+void printArray(const std::array<T, N>& arr) {
+    for (const auto& elem : arr) {
+        std::cout << elem << " ";
+    }
+    std::cout << std::endl;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 /// Constants
@@ -173,8 +186,22 @@ void translate(DTYPE t[3], const DTYPE *molA, DTYPE *molAT, int NmolA) {
 /// Volume functions
 ///////////////////////////////////////////////////////////////////////////////
 
+/// @brief Calculate the atom volume overlap between mols A and B
+/// @param molA - 1D array of 4 * NmolA entries. Each block of 4 is the coords and w parameter
+/// @param NmolA - number of atoms in A
+/// @param molB - 1D array of 4 * NmolB entries. Each block of 4 is the coords and w parameter
+/// @param NmolA - number of atoms in B
 DTYPE volume(const DTYPE *molA, int NmolA, const DTYPE *molB, int NmolB) {
     DTYPE V = 0.0;
+    std::cout << "volume for " << NmolA << " vs " << NmolB << std::endl;
+    for (int i = 0; i < NmolA; ++i) {
+        std::cout << i << " : " << molA[i * D] << ", " << molA[i * D + 1] << ", " << molA[i * D + 2]<< ", " << molA[i * D + 3] << std::endl;
+    }
+    std::cout << std::endl;
+    for (int i = 0; i < NmolB; ++i) {
+        std::cout << i << " : " << molB[i * D] << ", " << molB[i * D + 1] << ", " << molB[i * D + 2]<< ", " << molB[i * D + 3] << std::endl;
+    }
+    std::cout << std::endl;
 
     for (int i = 0; i < NmolA; i++) {
         for (int j = 0; j < NmolB; j++) {
@@ -201,10 +228,37 @@ DTYPE volume(const DTYPE *molA, int NmolA, const DTYPE *molB, int NmolB) {
     return V;
 }
 
+/// @brief Calculate the feature/color volume overlap between mols A and B.
+/// @param molA - 1D array of 4 * NmolA entries. Each block of 4 is the coords and w parameter
+/// @param NmolA - number of features in A
+/// @param molA_type - types of features
+/// @param molB - 1D array of 4 * NmolB entries. Each block of 4 is the coords and w parameter
+/// @param NmolA - number of features in B
+/// @param molB_type - types of features
+/// @param rmat - interaction matrix r - linearised square matrix for looking up r for features
+/// @param pmat - interaction matrix p - linearised square matrix for looking up p for features
+/// @N_features - the number of feature types for looking up values in rmat and pmat
 DTYPE volume_color(const DTYPE *molA, int NmolA, const int *molA_type,
                    const DTYPE *molB, int NmolB, const int *molB_type,
                    const DTYPE *rmat, const DTYPE *pmat, int N_features) {
     DTYPE V = 0.0;
+    std::cout << "volume_color for " << NmolA << " vs " << NmolB << std::endl;
+    for (int i = 0; i < NmolA; i++) {
+        std::cout << molA_type[i] << " ";
+    }
+    std::cout << std::endl;
+    for (int i = 0; i < NmolA; ++i) {
+        std::cout << i << " : " << molA[i * D] << ", " << molA[i * D + 1] << ", " << molA[i * D + 2]<< ", " << molA[i * D + 3] << std::endl;
+    }
+    std::cout << std::endl;
+    for (int i = 0; i < NmolB; i++) {
+        std::cout << molB_type[i] << " ";
+    }
+    std::cout << std::endl;
+    for (int i = 0; i < NmolB; ++i) {
+        std::cout << i << " : " << molB[i * D] << ", " << molB[i * D + 1] << ", " << molB[i * D + 2]<< ", " << molB[i * D + 3] << std::endl;
+    }
+    std::cout << std::endl;
 
     for (int i = 0; i < NmolA; i++) {
         int ta = molA_type[i];
@@ -391,10 +445,20 @@ void single_conformer_optimiser(const DTYPE *molA, DTYPE *molAT, const int *molA
         {0.0, 0.0, 0.0},
         {0.0, 0.0, 0.0}
     };
-    auto self_overlap_B = volume(molBT, NmolB_real, molBT, NmolB_real);
-    auto self_overlap_B_color = volume_color(molBT, NmolB_color, molB_type,
-                                             molBT, NmolB_color, molB_type,
+
+# if 0
+    auto self_overlap_AA = volume(molAT, NmolA_real, molAT, NmolA_real);
+    auto self_overlap_AA_color = volume_color(&molAT[NmolA_real*D], NmolA_color, molA_type,
+                                             &molAT[NmolA_real*D], NmolA_color, molA_type,
                                              rmat, pmat, N_features);
+    std::cout << "self_overlap_AA: " << self_overlap_AA << " color : " << self_overlap_AA_color << std::endl;
+#endif
+    auto self_overlap_B = volume(molBT, NmolB_real, molBT, NmolB_real);
+    // For the color volume, offset the coords to start at the color features
+    auto self_overlap_B_color = volume_color(&molBT[NmolB_real*D], NmolB_color, molB_type,
+                                             &molBT[NmolB_real*D], NmolB_color, molB_type,
+                                             rmat, pmat, N_features);
+    std::cout << "self_overlap_B: " << self_overlap_B << " color : " << self_overlap_B_color << std::endl;
     std::array<DTYPE, 7> cache = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
     // optimization loop
@@ -406,27 +470,40 @@ void single_conformer_optimiser(const DTYPE *molA, DTYPE *molAT, const int *molA
 
         quaternion_to_rotation_matrix(q, M);
 
+        // transform molB, putting the result in molBT.
         transform(M, molB, molBT, NmolB);
 
 
-        // 2. translate molA by -t
+        // 2. translate molA by -t, result into molAT.
         DTYPE mt[3] = {-t[0], -t[1], -t[2]};
         translate(mt, molA, molAT, NmolA);
 
 
         auto g = get_gradient(molAT, NmolA_real, molBT, NmolB_real);
+        std::cout << "step " << m << "  g = ";
+        printArray<DTYPE, 7>(g);
         g = g / (self_overlap_A + self_overlap_B); // normalize
+        std::cout << "step " << m << "  ng = ";
+        printArray<DTYPE, 7>(g);
 
 
         if (optim_color) {
-            auto g_c = get_gradient_color(&molAT[NmolA_real * D], NmolA_color, molA_type,
-                                          &molBT[NmolB_real * D], NmolB_color, molB_type,
+            // For the color volume, offset the coords to start at the color features
+            auto g_c = get_gradient_color(&molAT[NmolA_real*D], NmolA_color, molA_type,
+                                          &molBT[NmolB_real*D], NmolB_color, molB_type,
                                           rmat, pmat, N_features);
+            std::cout << "step " << m << "  g_c = ";
+            printArray<DTYPE, 7>(g_c);
 
             // normalize and combine
             g_c = g_c / (self_overlap_A_color + self_overlap_B_color);
+            std::cout << "step " << m << "  g_c = ";
+            printArray<DTYPE, 7>(g_c);
             auto g_combo = (1 - mixing_param) * g + mixing_param * g_c;
-            adagrad_step(q, t, g_combo, cache, lr_q, lr_t);
+            std::cout << "step " << m << "  g_combo = ";
+            printArray<DTYPE, 7>(g_combo);adagrad_step(q, t, g_combo, cache, lr_q, lr_t);
+            std::cout << "step " << m << "  g_combo = ";
+            printArray<DTYPE, 7>(g_combo);
         } else {
             adagrad_step(q, t, g, cache, lr_q, lr_t);
         }
@@ -443,8 +520,8 @@ void single_conformer_optimiser(const DTYPE *molA, DTYPE *molAT, const int *molA
 
     auto vol = volume(molA, NmolA_real, molBT, NmolB_real);
 
-    auto vc = volume_color(molA, NmolA_color, molA_type,
-                           molBT, NmolB_color, molB_type,
+    auto vc = volume_color(&molA[NmolA_real*D], NmolA_color, molA_type,
+                           &molBT[NmolB_real*D], NmolB_color, molB_type,
                            rmat, pmat, N_features);
 
     // compute tanimoto scores

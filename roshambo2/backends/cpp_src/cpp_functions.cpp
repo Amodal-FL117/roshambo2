@@ -308,8 +308,8 @@ std::array<DTYPE,2> self_overlap_single_color(py::array_t<DTYPE> A, py::array_t<
 /// @param B - the padded target coordinate data
 /// @param BT - the padded query types
 /// @param BN - the number of heavy atoms
-/// @param RMAT - interaction matrix r - square matrix for looking up r for features
-/// @param PMAT - interaction matrix p - square matrix for looking up p for features
+/// @param RMAT - interaction matrix r - linearised square matrix for looking up r for features
+/// @param PMAT - interaction matrix p - linearised square matrix for looking up p for features
 /// @param V - the output scores
 /// @param optim_color - whether to optimise on colors as well as shape
 /// @param mixing_param - how to mix the 2 tanimoto values
@@ -379,19 +379,72 @@ void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array
             // compute self overlap of A
             int NmolA_real = molA_num_atoms(k);
             int NmolA_color = NmolA -NmolA_real;
-
+			std::cout << "Mol A has " << NmolA_real << " atoms and " << NmolA_color << " features and "
+            << NmolA << " in total" << std::endl;
             auto self_overlap_A = volume(ptr_molA, NmolA_real, ptr_molA, NmolA_real);
             auto self_overlap_A_color = volume_color(&ptr_molA[NmolA_real*D], NmolA_color, &ptr_molA_type[NmolA_real], 
                                                     &ptr_molA[NmolA_real*D], NmolA_color, &ptr_molA_type[NmolA_real], 
                                                     ptr_rmat, ptr_pmat, N_features);
-
+			std::cout << "self_overlap_A: " << self_overlap_A << " color : " << self_overlap_A_color << std::endl;
 
             // parallel loop over each dataset configuration
             {
             #pragma omp parallel for
             for (long j = 0; j < molBs.shape(0); j++){
 
+#define USE_NEW 0
+#if USE_NEW == 1
+				std::cout << "NEW CODE" << std::endl;
+                // make a copy of molA and molB to transform
+                DTYPE molAT[NmolA*molAs.shape(2)];
+                std::memcpy(molAT, ptr_molA, NmolA*molAs.shape(2)*sizeof(DTYPE));
 
+                const DTYPE * ptr_molB = molBs.data(j,0,0);
+                int NmolB = molBs.shape(1);
+                const int * ptr_molB_type = molB_type.data(j,0);
+
+                DTYPE molBT[NmolB*molBs.shape(2)];
+                std::memcpy(molBT, ptr_molB, NmolB*molBs.shape(2)*sizeof(DTYPE));
+                int NmolB_real = molB_num_atoms(j);
+                int NmolB_color = NmolB -NmolB_real;
+				std::cout << "Mol B has " << NmolB_real << " atoms and " << NmolB_color << " features and "
+				<< NmolB << " in total" << std::endl;
+
+				DTYPE these_scores[20];
+				single_conformer_optimiser(ptr_molA, molAT, &ptr_molA_type[NmolA_real],
+                                           NmolA, NmolA_real, NmolA_color,
+											self_overlap_A, self_overlap_A_color,
+                                            ptr_molB, molBT, &ptr_molB_type[NmolB_real],
+											NmolB, NmolB_real, NmolB_color, ptr_rmat, ptr_pmat, N_features,
+										    optim_color, mixing_param, lr_q, lr_t, nsteps, these_scores);
+
+                // check the previous ones and keep the best
+                if (these_scores[0] > scores(k,j,0)){
+                    scores(k,j,0) = these_scores[0]; // combination tanimoto of shape and color
+                    scores(k,j,1) = these_scores[1]; // shape tanimoto
+                    scores(k,j,2) = these_scores[2]; // color tanimoto
+                    scores(k,j,3) = these_scores[3]; // volume shape
+                    scores(k,j,4) = these_scores[4]; // volumes color
+                    scores(k,j,5) = these_scores[5]; // self i
+                    scores(k,j,6) = these_scores[6]; // self j
+                    scores(k,j,7) = these_scores[7]; // self i color
+                    scores(k,j,8) = these_scores[8]; // self j color
+                    scores(k,j,9)  = these_scores[9];
+                    scores(k,j,10) = these_scores[10];
+                    scores(k,j,11) = these_scores[11];
+                    scores(k,j,12) = these_scores[12];
+                    scores(k,j,13) = these_scores[13];
+                    scores(k,j,14) = these_scores[14];
+                    scores(k,j,15) = these_scores[15];
+                    scores(k,j,16) = start_qr[0];
+                    scores(k,j,17) = start_qr[1];
+                    scores(k,j,18) = start_qr[2];
+                    scores(k,j,19) = start_qr[3];
+
+                } // if
+
+#else
+				std::cout << "OLD CODE" << std::endl;
                 std::array<DTYPE,4> q = {1.0,0.0,0.0,0.0}; // initial q
                 std::array<DTYPE,3> t = {0.0,0.0,0.0}; // initial t
 
@@ -415,11 +468,14 @@ void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array
 
                 int NmolB_real = molB_num_atoms(j);
                 int NmolB_color = NmolB -NmolB_real;
+				std::cout << "Mol B has " << NmolB_real << " atoms and " << NmolB_color << " features and "
+				<< NmolB << " in total" << std::endl;
 
                 auto self_overlap_B = volume(molBT, NmolB_real, molBT, NmolB_real);
                 auto self_overlap_B_color = volume_color(&molBT[NmolB_real*D],    NmolB_color, &ptr_molB_type[NmolB_real], 
                                                     &molBT[NmolB_real*D],    NmolB_color, &ptr_molB_type[NmolB_real], 
                                                     ptr_rmat, ptr_pmat, N_features);
+     			std::cout << "self_overlap_B: " << self_overlap_B << " color : " << self_overlap_B_color << std::endl;
 
 
                 std::array<DTYPE,7> cache = {0.0,0.0,0.0,0.0,0.0,0.0,0.0};
@@ -445,19 +501,30 @@ void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array
 
 
                     auto g = get_gradient(molAT, NmolA_real, molBT, NmolB_real);
+                    std::cout << "step " << m << "  g = ";
+                    printArray<DTYPE, 7>(g);
                     g = g/(self_overlap_A+self_overlap_B); // normalize
+                    std::cout << "step " << m << "  ng = ";
+                    printArray<DTYPE, 7>(g);
 
 
                     if(optim_color){
                         auto g_c = get_gradient_color(&molAT[NmolA_real*D],    NmolA_color, &ptr_molA_type[NmolA_real], 
                                                 &molBT[NmolB_real*D],    NmolB_color, &ptr_molB_type[NmolB_real], 
                                                 ptr_rmat, ptr_pmat, N_features);
-                    
+                                std::cout << "step " << m << "  g_c = ";
+            printArray<DTYPE, 7>(g_c);
+
                         // normalize and combine
                         g_c = g_c/(self_overlap_A_color+self_overlap_B_color);
+                                std::cout << "step " << m << "  g_c = ";
+            printArray<DTYPE, 7>(g_c);
                         auto g_combo = (1-mixing_param)*g + mixing_param*g_c;
+						std::cout << "step " << m << "  g_combo = ";
+						printArray<DTYPE, 7>(g_combo);
                         adagrad_step(q, t, g_combo, cache, lr_q, lr_t);
-
+						std::cout << "step " << m << "  g_combo = ";
+						printArray<DTYPE, 7>(g_combo);
                     }else{
                         adagrad_step(q, t, g, cache, lr_q, lr_t);
                         
@@ -503,10 +570,8 @@ void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array
                 // we use the mixing param to weight the tanimotos
                 // this is the objective function we have optimized
                 auto total = (ts *(1-mixing_param) + tc*mixing_param);
-
                 // printf("scores: %f %f %f\n", ts, tc, total);
 
-            
                 // check the previous ones and keep the best
                 if (total > scores(k,j,0)){
                     scores(k,j,0) = total; // combination tanimoto of shape and color
@@ -531,6 +596,7 @@ void optimize_overlap_color(py::array_t<DTYPE> A, py::array_t<int> AT, py::array
                     scores(k,j,19) = start_qr[3];
                     
                 } // if
+#endif
 
             } // for
             } // omp parallel
