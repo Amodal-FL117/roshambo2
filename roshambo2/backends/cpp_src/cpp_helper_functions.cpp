@@ -36,7 +36,6 @@ const DTYPE CARBONRADII2 = 1.7 * 1.7;
 const DTYPE A = KAPPA / CARBONRADII2;
 const DTYPE CONSTANT = pow(PI / (2 * A), 1.5);
 const DTYPE EPSILON = 1E-9;
-const std::array<int, 3> start_mode_n = {1, 4, 10};
 
 ////////////////////////////////////////////////////////////////////////////////
 /// For debug
