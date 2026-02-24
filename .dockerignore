@@ -1,0 +1,45 @@
+# Version control
+.git
+.gitignore
+.txt
+
+# Pixi local env (rebuilt inside container)
+.pixi/
+
+# Python caches
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist/
+build/
+*.egg
+
+# CMake build artifacts (rebuilt inside container)
+_roshambo2_cpp*.so
+_roshambo2_cuda*.so
+CMakeCache.txt
+CMakeFiles/
+
+# IDE / editor
+.vscode/
+.cursor/
+.idea/
+*.swp
+*.swo
+
+# Test / example output
+example/test_output_scores.csv
+example/*.h5
+
+# Documentation build
+doc/_build/
+
+# Docker
+Dockerfile
+.dockerignore
+docker-push.sh
+
+# OS junk
+.DS_Store
+Thumbs.db

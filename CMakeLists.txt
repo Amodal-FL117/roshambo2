@@ -20,7 +20,12 @@ find_package(pybind11)
 if (BUILD_WITH_CUDA)
     include_directories("${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
     # change here for newer or older cards
-    set(CMAKE_CUDA_ARCHITECTURES 60 70 80)
+    # Allow override via env var, otherwise target common architectures + Ada (L40S = 89)
+    if(DEFINED ENV{CMAKE_CUDA_ARCHITECTURES})
+        set(CMAKE_CUDA_ARCHITECTURES $ENV{CMAKE_CUDA_ARCHITECTURES})
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES 70 80 89)
+    endif()
 endif (BUILD_WITH_CUDA)
 
 # TODO: optional GPU build

@@ -1,0 +1,35 @@
+[workspace]
+name = "roshambo2"
+version = "1.0.0"
+description = "3D molecular shape overlap with Gaussian description"
+channels = ["conda-forge", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.11.*"
+numpy = "*"
+scipy = "*"
+rdkit = "*"
+tqdm = "*"
+h5py = "*"
+psutil = "*"
+flask = "*"
+requests = "*"
+pyyaml = "*"
+pandas = "*"
+# Build dependencies
+pip = "*"
+cmake = ">=3.18"
+pybind11 = "*"
+cxx-compiler = "*"
+# CUDA – use the system toolkit via the stub packages so nvcc stays at /usr/local/cuda
+cuda-version = "12.8.*"
+nvmolkit = ">=0.2.0,<0.3"
+
+[tasks]
+build = { cmd = "pip install -e . --no-build-isolation", env = { CMAKE_CUDA_ARCHITECTURES = "80;89" } }
+test  = { cmd = "python -c \"import roshambo2; print('roshambo2 OK')\"" }
+run-example = { cmd = "python example/smiles_to_roshambo2.py --help" }
+
+[activation]
+env = { PATH = "/usr/local/cuda/bin:$PATH", LD_LIBRARY_PATH = "/usr/local/cuda/lib64:$LD_LIBRARY_PATH", CUDA_HOME = "/usr/local/cuda" }
