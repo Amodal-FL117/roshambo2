@@ -77,28 +77,43 @@ from roshambo2.prepare import prepare_from_rdkitmols
 # Molecule preparation helpers
 # ---------------------------------------------------------------------------
 
+def canonicalize_smiles(smiles):
+    """Return the canonical SMILES for a molecule, or None if invalid.
+
+    Round-trips through RDKit to guarantee a reproducible canonical form
+    regardless of the input representation.
+    """
+    if smiles is None:
+        return None
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return Chem.MolToSmiles(mol, canonical=True)
+
+
 def prepare_mol(smiles, name=None):
-    """Create an RDKit molecule (with hydrogens) from a SMILES string.
+    """Create an RDKit molecule (with hydrogens) from a canonical SMILES.
 
     Does NOT generate conformers — that is done in batch via nvMolKit.
+    The input SMILES is canonicalized before use.
 
     Args:
         smiles (str): SMILES string.
-        name (str, optional): Molecule name. If None, uses the SMILES itself.
+        name (str, optional): Molecule name. If None, uses the canonical SMILES.
 
     Returns:
         rdkit.Chem.Mol or None: Molecule with explicit Hs (no conformers yet),
             or None if SMILES parsing failed.
     """
-    smi = smiles.strip()
+    smi = canonicalize_smiles(smiles.strip())
+    if smi is None:
+        print(f"  [WARNING] Failed to parse SMILES: {smiles.strip()}")
+        return None
+
     if name is None:
         name = smi
 
     mol = Chem.MolFromSmiles(smi)
-    if mol is None:
-        print(f"  [WARNING] Failed to parse SMILES: {smi}")
-        return None
-
     mol = Chem.AddHs(mol)
     mol.SetProp("_Name", name)
     return mol
@@ -424,17 +439,19 @@ def load_queries_from_smiles_csv(csv_path, uid_col="uid", smiles_col="smiles"):
     for _, row in tqdm(query_df.iterrows(), total=len(query_df),
                        desc="  Loading query SMILES"):
         uid = str(row[uid_col])
-        smi = str(row[smiles_col]).strip()
+        raw_smi = str(row[smiles_col]).strip()
 
-        if not smi or smi == "nan":
+        if not raw_smi or raw_smi == "nan":
+            n_skipped += 1
+            continue
+
+        smi = canonicalize_smiles(raw_smi)
+        if smi is None:
+            print(f"  [WARNING] Failed to parse SMILES for {uid}: {raw_smi}")
             n_skipped += 1
             continue
 
         mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            print(f"  [WARNING] Failed to parse SMILES for {uid}: {smi}")
-            n_skipped += 1
-            continue
 
         # Keep largest fragment if multi-fragment
         num_frags = len(rdmolops.GetMolFrags(mol))
@@ -475,8 +492,12 @@ def load_dataset_from_csv(csv_path, smiles_col="smiles", name_col=None):
 
     results = []
     for idx, row in df.iterrows():
-        smi = str(row[smiles_col]).strip()
-        if not smi or smi == "nan":
+        raw_smi = str(row[smiles_col]).strip()
+        if not raw_smi or raw_smi == "nan":
+            continue
+        smi = canonicalize_smiles(raw_smi)
+        if smi is None:
+            print(f"  [WARNING] Skipping invalid SMILES at row {idx}: {raw_smi}")
             continue
         if name_col and name_col in df.columns:
             name = str(row[name_col]).strip()
