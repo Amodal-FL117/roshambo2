@@ -689,8 +689,8 @@ def main():
         help="Compute backend (default: cuda)."
     )
     parser.add_argument(
-        "--color", action="store_true",
-        help="Enable color (pharmacophore) features."
+        "--pharmacophore", action="store_true", dest="color",
+        help="Enable pharmacophore (color) features."
     )
     parser.add_argument(
         "--optim_mode", type=str, default=None,
@@ -876,7 +876,7 @@ def main():
     n_batches = (n_queries + batch_size - 1) // batch_size
 
     print(f"  Backend:          {args.backend}")
-    print(f"  Color:            {args.color}")
+    print(f"  Pharmacophore:    {args.color}")
     print(f"  Optim mode:       {optim_mode}")
     print(f"  Start mode:       {args.start_mode}")
     print(f"  Max results:      {args.max_results} per query")
