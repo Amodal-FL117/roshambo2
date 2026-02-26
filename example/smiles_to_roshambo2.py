@@ -20,8 +20,9 @@ Optimized for large-scale runs (e.g. 10K queries × 600 dataset molecules):
 --dataset_h5 specifies the path to the H5 dataset file. If the file already
 exists it is loaded directly. If it does not exist, one of the following
 must be provided:
-  - --dataset_sdf: An SDF file with pre-computed 3D poses. Molecules are
-    loaded with their existing coordinates (no conformer generation).
+  - --dataset_sdf: One or more SDF files with pre-computed 3D poses.
+    Molecules are loaded with their existing coordinates (no conformer
+    generation). Pass multiple paths to combine several SDF files.
   - --dataset_csv: A CSV of SMILES. Conformers are generated via nvMolKit.
 --dataset_sdf takes priority over --dataset_csv. The resulting H5 is saved
 to the --dataset_h5 path for future reuse.
@@ -66,6 +67,7 @@ Usage:
 
 import argparse
 import gc
+import json
 import os
 import sys
 import time
@@ -481,8 +483,8 @@ def load_queries_from_smiles_csv(csv_path, uid_col="uid", smiles_col="smiles"):
     return query_mols, name_to_uid
 
 
-def load_dataset_from_sdf(sdf_path):
-    """Load reference dataset molecules from an SDF file (pre-computed poses).
+def load_dataset_from_sdf(sdf_paths):
+    """Load reference dataset molecules from one or more SDF files.
 
     Unlike ``load_dataset_from_csv`` (which generates conformers), this
     function loads molecules that already have 3D coordinates.  Each
@@ -490,46 +492,57 @@ def load_dataset_from_sdf(sdf_path):
     generation or energy minimisation is performed.
 
     Args:
-        sdf_path (str): Path to an SDF file containing one or more
-            molecules with 3D coordinates.
+        sdf_paths (str or list[str]): Path to a single SDF file, or a
+            list of SDF file paths.  All molecules are combined into a
+            single reference set.
 
     Returns:
         list[rdkit.Chem.Mol]: RDKit mol objects with explicit Hs and
             their original conformers.
     """
-    if not os.path.isfile(sdf_path):
-        raise FileNotFoundError(f"SDF dataset not found: {sdf_path}")
+    # Normalise to a list
+    if isinstance(sdf_paths, str):
+        sdf_paths = [sdf_paths]
 
     mols = []
     n_skipped = 0
+    global_idx = 0  # running index across all files
 
-    with SDMolSupplier(sdf_path, sanitize=True, removeHs=False) as supplier:
-        for idx, mol in enumerate(tqdm(supplier, desc="  Loading dataset SDF")):
-            if mol is None:
-                n_skipped += 1
-                continue
+    for sdf_path in sdf_paths:
+        if not os.path.isfile(sdf_path):
+            print(f"  [WARNING] SDF file not found, skipping: {sdf_path}")
+            continue
 
-            # Keep largest fragment if multi-fragment
-            num_frags = len(rdmolops.GetMolFrags(mol))
-            if num_frags > 1:
-                mol = get_largest_fragment(mol)
+        with SDMolSupplier(sdf_path, sanitize=True, removeHs=False) as supplier:
+            for mol in tqdm(supplier, desc=f"  Loading {os.path.basename(sdf_path)}"):
+                if mol is None:
+                    n_skipped += 1
+                    global_idx += 1
+                    continue
 
-            # Ensure explicit Hs
-            mol = Chem.AddHs(mol, addCoords=True)
+                # Keep largest fragment if multi-fragment
+                num_frags = len(rdmolops.GetMolFrags(mol))
+                if num_frags > 1:
+                    mol = get_largest_fragment(mol)
 
-            # Set a name if missing
-            if not mol.HasProp("_Name") or not mol.GetProp("_Name").strip():
-                mol.SetProp("_Name", f"ref_{idx}")
+                # Ensure explicit Hs
+                mol = Chem.AddHs(mol, addCoords=True)
 
-            if mol.GetNumConformers() == 0:
-                print(f"  [WARNING] Molecule ref_{idx} has no conformers — skipping")
-                n_skipped += 1
-                continue
+                # Set a name if missing
+                if not mol.HasProp("_Name") or not mol.GetProp("_Name").strip():
+                    mol.SetProp("_Name", f"ref_{global_idx}")
 
-            mols.append(mol)
+                if mol.GetNumConformers() == 0:
+                    print(f"  [WARNING] Molecule ref_{global_idx} has no conformers — skipping")
+                    n_skipped += 1
+                    global_idx += 1
+                    continue
+
+                mols.append(mol)
+                global_idx += 1
 
     if n_skipped > 0:
-        print(f"  [INFO] Skipped {n_skipped} invalid/conformer-less entries from SDF")
+        print(f"  [INFO] Skipped {n_skipped} invalid/conformer-less entries from SDF(s)")
 
     return mols
 
@@ -644,6 +657,99 @@ def build_per_mol_dataframe(scores_dict, name_to_uid, best_fit_mols=None):
 
 
 # ---------------------------------------------------------------------------
+# Dataset preparation helper
+# ---------------------------------------------------------------------------
+
+def prepare_dataset(ds_cfg, color, hardware_options=None, mmff_max_iters=500,
+                    embed_chunk_size=2000):
+    """Prepare a single reference dataset and return the H5 path.
+
+    ``ds_cfg`` is a dict with the following keys (all optional except ``h5``):
+      - ``h5``:         Path where the H5 will be written / read from.
+      - ``sdf``:        Path (or list of paths) to SDF file(s) with
+                        pre-computed poses.
+      - ``csv``:        Path to a CSV of SMILES.
+      - ``smiles_col``: SMILES column name in the CSV (default ``"smiles"``).
+      - ``name_col``:   Optional molecule-name column.
+      - ``n_confs``:    Conformers per molecule when generating from CSV.
+      - ``prefix``:     Label for this dataset (used for output file naming).
+
+    Priority:
+      1. If the H5 already exists **and** no ``sdf`` is given → reuse.
+      2. ``sdf`` → load poses as-is, (re)build H5.
+      3. ``csv`` → generate conformers, build H5.
+
+    Returns:
+        str: Path to the ready-to-use H5 dataset.
+    """
+    h5_path = ds_cfg["h5"]
+    sdf_path = ds_cfg.get("sdf")   # str, list[str], or None
+    csv_path = ds_cfg.get("csv")
+    smiles_col = ds_cfg.get("smiles_col", "smiles")
+    name_col = ds_cfg.get("name_col")
+    n_confs = ds_cfg.get("n_confs", 5)
+    prefix = ds_cfg.get("prefix", "")
+
+    label = f"'{prefix}'" if prefix else "default"
+
+    # If SDF is explicitly provided, always (re)build H5 from it
+    # sdf_path can be a single string or a list of strings
+    if sdf_path:
+        if isinstance(sdf_path, list):
+            print(f"  [{label}] Loading reference poses from {len(sdf_path)} SDF file(s)")
+        else:
+            print(f"  [{label}] Loading reference poses from SDF: {sdf_path}")
+        dataset_mols = load_dataset_from_sdf(sdf_path)
+        if not dataset_mols:
+            print(f"ERROR: No valid molecules in dataset SDF for {label}. Skipping.")
+            return None
+        print(f"  [{label}] {len(dataset_mols)} molecule(s) loaded with existing poses")
+        prepare_from_rdkitmols(dataset_mols, color=color).save_to_h5(h5_path)
+        print(f"  [{label}] Saved H5: {h5_path}")
+        return h5_path
+
+    # Reuse existing H5 if present
+    if os.path.isfile(h5_path):
+        print(f"  [{label}] H5 already exists, reusing: {h5_path}")
+        return h5_path
+
+    # Build from CSV
+    if csv_path:
+        smiles_pairs = load_dataset_from_csv(csv_path, smiles_col=smiles_col,
+                                             name_col=name_col)
+        if not smiles_pairs:
+            print(f"ERROR: No valid SMILES in dataset CSV for {label}. Skipping.")
+            return None
+
+        dataset_mols = [
+            m for m in (prepare_mol(smi, name=name) for smi, name in smiles_pairs)
+            if m is not None
+        ]
+        if not dataset_mols:
+            print(f"ERROR: No valid dataset molecules parsed for {label}. Skipping.")
+            return None
+
+        print(f"  [{label}] Generating {n_confs} conformer(s) for "
+              f"{len(dataset_mols)} reference molecules...")
+        dataset_mols = embed_and_optimize(
+            dataset_mols, n_confs=n_confs,
+            hardware_options=hardware_options, mmff_max_iters=mmff_max_iters,
+            chunk_size=embed_chunk_size,
+        )
+        if not dataset_mols:
+            print(f"ERROR: Conformer generation failed for all ref molecules "
+                  f"in {label}. Skipping.")
+            return None
+
+        prepare_from_rdkitmols(dataset_mols, color=color).save_to_h5(h5_path)
+        print(f"  [{label}] Saved H5: {h5_path}")
+        return h5_path
+
+    print(f"ERROR: No source (sdf/csv/h5) for dataset {label}.")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Core batch runner
 # ---------------------------------------------------------------------------
 
@@ -742,22 +848,30 @@ def main():
     )
 
     # Dataset input (the reference library — typically smaller)
+    # Option A: multiple reference sets via JSON
     parser.add_argument(
-        "--dataset_h5", type=str, required=True,
+        "--datasets", type=str, default=None,
+        help='JSON list of dataset configs, each with "h5", and optionally '
+             '"sdf", "csv", "smiles_col", "n_confs", "prefix". '
+             'Example: \'[{"h5":"a.h5","csv":"a.csv","prefix":"actives"}]\'. '
+             'When set, the single-dataset flags below are ignored.'
+    )
+    # Option B: single reference set via individual flags (backward compat)
+    parser.add_argument(
+        "--dataset_h5", type=str, default=None,
         help="Path to the roshambo2 H5 dataset file. "
              "If it exists it is loaded directly. "
-             "Otherwise --dataset_csv must also be given."
+             "Otherwise --dataset_sdf or --dataset_csv must be given."
     )
     parser.add_argument(
         "--dataset_csv", type=str, default=None,
         help="CSV of dataset SMILES. Used only when --dataset_h5 doesn't exist."
     )
     parser.add_argument(
-        "--dataset_sdf", type=str, default=None,
-        help="SDF file with pre-computed 3D poses for the reference dataset. "
+        "--dataset_sdf", type=str, nargs="+", default=None,
+        help="One or more SDF files with pre-computed 3D poses. "
              "When provided, poses are used as-is (no conformer generation). "
-             "Used only when --dataset_h5 doesn't exist. "
-             "Takes priority over --dataset_csv."
+             "Always rebuilds the H5. Takes priority over --dataset_csv."
     )
     parser.add_argument(
         "--smiles_col", type=str, default="smiles",
@@ -906,113 +1020,104 @@ def main():
 
     print(f"  {len(query_mols)} query molecule(s) with conformers ready")
 
-    # ── 2. Prepare the reference dataset ─────────────────────────────
-    print()
-    print("=" * 60)
-    print("Step 2: Preparing reference dataset...")
-    print("=" * 60)
-
-    h5_path = args.dataset_h5
-
-    if os.path.isfile(h5_path):
-        dataset_input = h5_path
-        print(f"  H5 already exists, reusing: {h5_path}")
-
-    elif args.dataset_sdf:
-        # ---- SDF poses: load pre-computed 3D coordinates directly ----
-        print(f"  Loading reference poses from SDF: {args.dataset_sdf}")
-        dataset_mols = load_dataset_from_sdf(args.dataset_sdf)
-        if not dataset_mols:
-            print("ERROR: No valid molecules in dataset SDF. Exiting.")
+    # ── 2. Build the list of reference datasets ────────────────────
+    # Either from --datasets JSON or from the individual flags.
+    if args.datasets:
+        try:
+            dataset_list = json.loads(args.datasets)
+        except json.JSONDecodeError:
+            print(f"ERROR: Could not parse --datasets JSON: {args.datasets}")
             sys.exit(1)
-
-        print(f"  {len(dataset_mols)} reference molecule(s) loaded with existing poses")
-        prepare_from_rdkitmols(dataset_mols, color=args.color).save_to_h5(h5_path)
-        dataset_input = h5_path
-        print(f"  Saved H5: {h5_path}")
-
-    elif args.dataset_csv:
-        # ---- CSV SMILES: generate conformers from scratch ----
-        smiles_pairs = load_dataset_from_csv(
-            args.dataset_csv, smiles_col=args.smiles_col, name_col=args.name_col,
-        )
-        if not smiles_pairs:
-            print("ERROR: No valid SMILES in dataset CSV. Exiting.")
-            sys.exit(1)
-
-        dataset_mols = [
-            m for m in (prepare_mol(smi, name=name) for smi, name in smiles_pairs)
-            if m is not None
-        ]
-        if not dataset_mols:
-            print("ERROR: No valid dataset molecules parsed. Exiting.")
-            sys.exit(1)
-
-        print(f"  Generating {args.n_confs} conformer(s) for {len(dataset_mols)} "
-              f"reference molecules...")
-        dataset_mols = embed_and_optimize(
-            dataset_mols, n_confs=args.n_confs,
-            hardware_options=hardware_options, mmff_max_iters=args.mmff_max_iters,
-            chunk_size=args.embed_chunk_size,
-        )
-        if not dataset_mols:
-            print("ERROR: Conformer generation failed for all ref molecules. Exiting.")
-            sys.exit(1)
-
-        prepare_from_rdkitmols(dataset_mols, color=args.color).save_to_h5(h5_path)
-        dataset_input = h5_path
-        print(f"  Saved H5: {h5_path}")
-
+    elif args.dataset_h5:
+        # Backward-compatible single dataset from individual flags
+        dataset_list = [{
+            "h5":         args.dataset_h5,
+            "sdf":        args.dataset_sdf,
+            "csv":        args.dataset_csv,
+            "smiles_col": args.smiles_col,
+            "name_col":   args.name_col,
+            "n_confs":    args.n_confs,
+            "prefix":     "",
+        }]
     else:
-        print(f"ERROR: H5 not found at {h5_path} and neither --dataset_sdf "
-              f"nor --dataset_csv provided. Exiting.")
+        print("ERROR: Provide --datasets or --dataset_h5. Exiting.")
         sys.exit(1)
 
-    # ── 3. Run roshambo2 in query batches ────────────────────────────
-    print()
-    print("=" * 60)
-    print("Step 3: Running roshambo2 shape overlay...")
-    print("=" * 60)
+    print(f"\n  Reference datasets to process: {len(dataset_list)}")
+    for ds in dataset_list:
+        pfx = ds.get("prefix", "")
+        print(f"    • {pfx or '(default)'}: h5={ds.get('h5')}")
 
-    optim_mode = args.optim_mode or ("combination" if args.color else "shape")
+    all_output_csvs = []
 
-    n_queries = len(query_mols)
-    batch_size = min(args.query_batch_size, n_queries)
-    n_batches = (n_queries + batch_size - 1) // batch_size
+    for ds_idx, ds_cfg in enumerate(dataset_list):
+        prefix = ds_cfg.get("prefix", "")
+        label = prefix or "default"
 
-    print(f"  Backend:          {args.backend}")
-    print(f"  Pharmacophore:    {args.color}")
-    print(f"  Optim mode:       {optim_mode}")
-    print(f"  Start mode:       {args.start_mode}")
-    print(f"  Max results:      {args.max_results} per query")
-    print(f"  Save SDF:         {args.save_sdf}")
-    print(f"  Query batching:   {n_queries} queries → {n_batches} batch(es) of ≤{batch_size}")
-    print()
+        # ── 2.x  Prepare the reference dataset ───────────────────────
+        print()
+        print("=" * 60)
+        print(f"Step 2.{ds_idx + 1}: Preparing reference dataset '{label}'...")
+        print("=" * 60)
 
-    output_csv = f"{args.output_prefix}_scores.csv"
-    if os.path.isfile(output_csv):
-        os.remove(output_csv)
-
-    total_rows = 0
-    write_header = True
-
-    for batch_idx in tqdm(range(n_batches), desc="  Query batches"):
-        start = batch_idx * batch_size
-        end = min(start + batch_size, n_queries)
-        batch_mols = query_mols[start:end]
-
-        t_batch = time.perf_counter()
-        n_rows = run_roshambo2_batch(
-            batch_mols, dataset_input, args, query_name_to_uid,
-            output_csv, write_header,
+        h5_path = prepare_dataset(
+            ds_cfg, color=args.color,
+            hardware_options=hardware_options,
+            mmff_max_iters=args.mmff_max_iters,
+            embed_chunk_size=args.embed_chunk_size,
         )
-        elapsed = time.perf_counter() - t_batch
-        total_rows += n_rows
-        write_header = False
+        if h5_path is None:
+            print(f"  ⚠ Skipping dataset '{label}' (preparation failed).")
+            continue
 
-        tqdm.write(f"    Batch {batch_idx + 1}/{n_batches}: "
-                   f"{len(batch_mols)} queries → {n_rows} rows in {elapsed:.1f}s  "
-                   f"(cumulative: {total_rows})")
+        # ── 3.x  Run roshambo2 in query batches ─────────────────────
+        print()
+        print("=" * 60)
+        print(f"Step 3.{ds_idx + 1}: Running roshambo2 overlay vs '{label}'...")
+        print("=" * 60)
+
+        optim_mode = args.optim_mode or ("combination" if args.color else "shape")
+
+        n_queries = len(query_mols)
+        batch_size = min(args.query_batch_size, n_queries)
+        n_batches = (n_queries + batch_size - 1) // batch_size
+
+        print(f"  Backend:          {args.backend}")
+        print(f"  Pharmacophore:    {args.color}")
+        print(f"  Optim mode:       {optim_mode}")
+        print(f"  Start mode:       {args.start_mode}")
+        print(f"  Max results:      {args.max_results} per query")
+        print(f"  Save SDF:         {args.save_sdf}")
+        print(f"  Query batching:   {n_queries} queries → {n_batches} batch(es) of ≤{batch_size}")
+        print()
+
+        suffix = f"_{prefix}" if prefix else ""
+        output_csv = f"{args.output_prefix}{suffix}_scores.csv"
+        if os.path.isfile(output_csv):
+            os.remove(output_csv)
+
+        total_rows = 0
+        write_header = True
+
+        for batch_idx in tqdm(range(n_batches), desc=f"  Batches ({label})"):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, n_queries)
+            batch_mols = query_mols[start:end]
+
+            t_batch = time.perf_counter()
+            n_rows = run_roshambo2_batch(
+                batch_mols, h5_path, args, query_name_to_uid,
+                output_csv, write_header,
+            )
+            elapsed = time.perf_counter() - t_batch
+            total_rows += n_rows
+            write_header = False
+
+            tqdm.write(f"    Batch {batch_idx + 1}/{n_batches}: "
+                       f"{len(batch_mols)} queries → {n_rows} rows in {elapsed:.1f}s  "
+                       f"(cumulative: {total_rows})")
+
+        all_output_csvs.append((label, output_csv, total_rows))
 
     # ── 4. Summary ───────────────────────────────────────────────────
     print()
@@ -1020,11 +1125,11 @@ def main():
     print("Done!")
     print("=" * 60)
     elapsed_total = time.perf_counter() - t_start
-    print(f"  Total rows:   {total_rows}")
-    print(f"  Output CSV:   {output_csv}")
+    for label, csv_path, rows in all_output_csvs:
+        print(f"  [{label}]  {rows:,} rows  →  {csv_path}")
     print(f"  Elapsed time: {elapsed_total:.1f}s")
 
-    return output_csv
+    return [csv for _, csv, _ in all_output_csvs]
 
 
 if __name__ == "__main__":
