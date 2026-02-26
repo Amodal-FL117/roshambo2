@@ -18,9 +18,13 @@ Optimized for large-scale runs (e.g. 10K queries × 600 dataset molecules):
   - max_results caps per-query hits to avoid unbounded memory growth.
 
 --dataset_h5 specifies the path to the H5 dataset file. If the file already
-exists it is loaded directly. If it does not exist, --dataset_csv must also
-be provided so conformers can be generated and the resulting H5 saved to
-the given path for future reuse.
+exists it is loaded directly. If it does not exist, one of the following
+must be provided:
+  - --dataset_sdf: An SDF file with pre-computed 3D poses. Molecules are
+    loaded with their existing coordinates (no conformer generation).
+  - --dataset_csv: A CSV of SMILES. Conformers are generated via nvMolKit.
+--dataset_sdf takes priority over --dataset_csv. The resulting H5 is saved
+to the --dataset_h5 path for future reuse.
 
 Uses nvMolKit for:
   - ETKDG conformer embedding on GPU (EmbedMolecules)
@@ -46,6 +50,10 @@ Dataset CSV format (--dataset_csv):
 Usage:
     # Use a pre-built H5 dataset
     python smiles_to_roshambo2.py --query_csv queries.csv --dataset_h5 dataset.h5
+
+    # Use pre-computed SDF poses as reference (no conformer generation)
+    python smiles_to_roshambo2.py --query_csv queries.csv \\
+        --dataset_h5 /data/dataset.h5 --dataset_sdf docked_poses.sdf
 
     # Generate H5 from a CSV of SMILES (H5 is saved and reused on next run)
     python smiles_to_roshambo2.py --query_csv queries.csv \\
@@ -473,6 +481,59 @@ def load_queries_from_smiles_csv(csv_path, uid_col="uid", smiles_col="smiles"):
     return query_mols, name_to_uid
 
 
+def load_dataset_from_sdf(sdf_path):
+    """Load reference dataset molecules from an SDF file (pre-computed poses).
+
+    Unlike ``load_dataset_from_csv`` (which generates conformers), this
+    function loads molecules that already have 3D coordinates.  Each
+    molecule's existing conformers are preserved as-is — no conformer
+    generation or energy minimisation is performed.
+
+    Args:
+        sdf_path (str): Path to an SDF file containing one or more
+            molecules with 3D coordinates.
+
+    Returns:
+        list[rdkit.Chem.Mol]: RDKit mol objects with explicit Hs and
+            their original conformers.
+    """
+    if not os.path.isfile(sdf_path):
+        raise FileNotFoundError(f"SDF dataset not found: {sdf_path}")
+
+    mols = []
+    n_skipped = 0
+
+    with SDMolSupplier(sdf_path, sanitize=True, removeHs=False) as supplier:
+        for idx, mol in enumerate(tqdm(supplier, desc="  Loading dataset SDF")):
+            if mol is None:
+                n_skipped += 1
+                continue
+
+            # Keep largest fragment if multi-fragment
+            num_frags = len(rdmolops.GetMolFrags(mol))
+            if num_frags > 1:
+                mol = get_largest_fragment(mol)
+
+            # Ensure explicit Hs
+            mol = Chem.AddHs(mol, addCoords=True)
+
+            # Set a name if missing
+            if not mol.HasProp("_Name") or not mol.GetProp("_Name").strip():
+                mol.SetProp("_Name", f"ref_{idx}")
+
+            if mol.GetNumConformers() == 0:
+                print(f"  [WARNING] Molecule ref_{idx} has no conformers — skipping")
+                n_skipped += 1
+                continue
+
+            mols.append(mol)
+
+    if n_skipped > 0:
+        print(f"  [INFO] Skipped {n_skipped} invalid/conformer-less entries from SDF")
+
+    return mols
+
+
 def load_dataset_from_csv(csv_path, smiles_col="smiles", name_col=None):
     """Load dataset SMILES from a CSV file.
 
@@ -692,6 +753,13 @@ def main():
         help="CSV of dataset SMILES. Used only when --dataset_h5 doesn't exist."
     )
     parser.add_argument(
+        "--dataset_sdf", type=str, default=None,
+        help="SDF file with pre-computed 3D poses for the reference dataset. "
+             "When provided, poses are used as-is (no conformer generation). "
+             "Used only when --dataset_h5 doesn't exist. "
+             "Takes priority over --dataset_csv."
+    )
+    parser.add_argument(
         "--smiles_col", type=str, default="smiles",
         help='SMILES column in dataset CSV (default: "smiles").'
     )
@@ -849,11 +917,22 @@ def main():
     if os.path.isfile(h5_path):
         dataset_input = h5_path
         print(f"  H5 already exists, reusing: {h5_path}")
-    else:
-        if not args.dataset_csv:
-            print(f"ERROR: H5 not found at {h5_path} and no --dataset_csv. Exiting.")
+
+    elif args.dataset_sdf:
+        # ---- SDF poses: load pre-computed 3D coordinates directly ----
+        print(f"  Loading reference poses from SDF: {args.dataset_sdf}")
+        dataset_mols = load_dataset_from_sdf(args.dataset_sdf)
+        if not dataset_mols:
+            print("ERROR: No valid molecules in dataset SDF. Exiting.")
             sys.exit(1)
 
+        print(f"  {len(dataset_mols)} reference molecule(s) loaded with existing poses")
+        prepare_from_rdkitmols(dataset_mols, color=args.color).save_to_h5(h5_path)
+        dataset_input = h5_path
+        print(f"  Saved H5: {h5_path}")
+
+    elif args.dataset_csv:
+        # ---- CSV SMILES: generate conformers from scratch ----
         smiles_pairs = load_dataset_from_csv(
             args.dataset_csv, smiles_col=args.smiles_col, name_col=args.name_col,
         )
@@ -883,6 +962,11 @@ def main():
         prepare_from_rdkitmols(dataset_mols, color=args.color).save_to_h5(h5_path)
         dataset_input = h5_path
         print(f"  Saved H5: {h5_path}")
+
+    else:
+        print(f"ERROR: H5 not found at {h5_path} and neither --dataset_sdf "
+              f"nor --dataset_csv provided. Exiting.")
+        sys.exit(1)
 
     # ── 3. Run roshambo2 in query batches ────────────────────────────
     print()
