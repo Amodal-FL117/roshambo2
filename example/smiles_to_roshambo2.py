@@ -69,6 +69,7 @@ import argparse
 import gc
 import json
 import os
+import pickle
 import sys
 import time
 
@@ -588,6 +589,39 @@ def load_dataset_from_csv(csv_path, smiles_col="smiles", name_col=None):
 # Results post-processing
 # ---------------------------------------------------------------------------
 
+def save_conf_cache(cache_path, query_mols, name_to_uid):
+    """Persist conformer-embedded query molecules to disk as a pickle.
+
+    Saves the RDKit mol objects (with all conformers and properties) and
+    the name_to_uid mapping so that a resumed run can skip the expensive
+    GPU conformer generation step entirely.
+    """
+    with open(cache_path, "wb") as f:
+        pickle.dump({"mols": query_mols, "name_to_uid": name_to_uid}, f,
+                     protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"  [CACHE] Saved {len(query_mols)} molecule(s) → {cache_path}")
+
+
+def load_conf_cache(cache_path):
+    """Load previously cached conformer-embedded query molecules.
+
+    Returns (query_mols, name_to_uid) or (None, None) if the cache
+    doesn't exist or is corrupt.
+    """
+    if not os.path.isfile(cache_path):
+        return None, None
+    try:
+        with open(cache_path, "rb") as f:
+            data = pickle.load(f)
+        mols = data["mols"]
+        name_to_uid = data["name_to_uid"]
+        print(f"  [CACHE] Loaded {len(mols)} molecule(s) from {cache_path}")
+        return mols, name_to_uid
+    except Exception as e:
+        print(f"  [CACHE] Failed to load cache ({e}), regenerating conformers")
+        return None, None
+
+
 def _strip_conf_suffix(name):
     """Strip trailing conformer suffix like '_0', '_1' from a molecule name."""
     if "_" in name and name.rsplit("_", 1)[-1].isdigit():
@@ -816,7 +850,66 @@ def run_roshambo2_batch(query_mols, dataset_input, args, name_to_uid,
 # Main
 # ---------------------------------------------------------------------------
 
+def _run_sequential(config_path):
+    """Run smiles_to_roshambo2.py for each target listed in a sequential-config YAML.
+
+    Config format::
+
+        targets:
+          - name: mc4r
+            command: ["--query_csv", "...", "--output_prefix", "...", ...]
+          - name: d2r
+            command: [...]
+    """
+    import subprocess
+    import yaml
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    targets = config.get("targets", [])
+    n = len(targets)
+    sep = "=" * 64
+
+    print(f"\n{sep}", flush=True)
+    print(f"  Sequential roshambo2 — {n} target(s)", flush=True)
+    print(f"  Config: {config_path}", flush=True)
+    print(f"{sep}", flush=True)
+
+    failed = []
+    for i, target in enumerate(targets, 1):
+        name = target.get("name", f"target_{i}")
+        command = target["command"]
+
+        print(f"\n{sep}", flush=True)
+        print(f"  [{i}/{n}] {name}", flush=True)
+        print(f"{sep}\n", flush=True)
+
+        proc = subprocess.run([sys.executable, __file__] + command)
+        if proc.returncode != 0:
+            failed.append((name, proc.returncode))
+            print(f"\n  FAILED: {name} (exit code {proc.returncode})", flush=True)
+
+    print(f"\n{sep}", flush=True)
+    if failed:
+        print(f"  {len(failed)}/{n} targets FAILED:", flush=True)
+        for name, rc in failed:
+            print(f"    - {name} (exit code {rc})", flush=True)
+        print(sep, flush=True)
+        sys.exit(1)
+    print(f"  All {n} roshambo2 targets completed successfully", flush=True)
+    print(sep, flush=True)
+
+
 def main():
+    # Check for sequential mode before full argparse (avoids required-arg conflicts)
+    _seq_parser = argparse.ArgumentParser(add_help=False)
+    _seq_parser.add_argument("--sequential-config", type=str, default=None)
+    _seq_args, _ = _seq_parser.parse_known_args()
+    if _seq_args.sequential_config:
+        _run_sequential(_seq_args.sequential_config)
+        return
+
     parser = argparse.ArgumentParser(
         description="Generate conformers from SMILES and run roshambo2 shape overlay."
     )
@@ -958,6 +1051,12 @@ def main():
         "--mmff_max_iters", type=int, default=500,
         help="Max MMFF optimisation iterations (default: 500)."
     )
+    parser.add_argument(
+        "--conf_cache", type=str, default=None,
+        help="Path to a conformer cache file (.pkl). When set, query "
+             "conformers are saved after generation and reloaded on "
+             "subsequent runs, skipping the expensive GPU embedding step."
+    )
 
     args = parser.parse_args()
 
@@ -985,40 +1084,47 @@ def main():
     print(f"  CSV file:   {args.query_csv}")
     print(f"  UID column: {args.uid_col}")
 
-    if args.query_smiles_col:
-        # ---- SMILES-based queries (no 3D coords yet) ----
-        print(f"  SMILES col: {args.query_smiles_col}")
-        query_mols, query_name_to_uid = load_queries_from_smiles_csv(
-            args.query_csv, uid_col=args.uid_col, smiles_col=args.query_smiles_col,
+    # Try loading from conformer cache first
+    _cache_hit = False
+    if args.conf_cache:
+        query_mols, query_name_to_uid = load_conf_cache(args.conf_cache)
+        if query_mols is not None:
+            _cache_hit = True
+            print(f"  {len(query_mols)} query molecule(s) with conformers ready (from cache)")
+
+    if not _cache_hit:
+        if args.query_smiles_col:
+            print(f"  SMILES col: {args.query_smiles_col}")
+            query_mols, query_name_to_uid = load_queries_from_smiles_csv(
+                args.query_csv, uid_col=args.uid_col, smiles_col=args.query_smiles_col,
+            )
+        else:
+            print(f"  SDF column: {args.sdf_col}")
+            query_mols, query_name_to_uid = load_queries_from_csv(
+                args.query_csv, uid_col=args.uid_col, sdf_col=args.sdf_col,
+            )
+
+        if not query_mols:
+            print("ERROR: No valid query molecules found. Exiting.")
+            sys.exit(1)
+
+        n_unique = len(set(query_name_to_uid.values()))
+        print(f"  Loaded {len(query_mols)} query molecule(s), {n_unique} unique UID(s)")
+
+        print(f"  Generating {args.query_confs} conformer(s) per query...")
+        query_mols = embed_and_optimize(
+            query_mols, n_confs=args.query_confs,
+            hardware_options=hardware_options, mmff_max_iters=args.mmff_max_iters,
+            chunk_size=args.embed_chunk_size,
         )
-    else:
-        # ---- SDF-based queries (already have 3D coords) ----
-        print(f"  SDF column: {args.sdf_col}")
-        query_mols, query_name_to_uid = load_queries_from_csv(
-            args.query_csv, uid_col=args.uid_col, sdf_col=args.sdf_col,
-        )
+        if not query_mols:
+            print("ERROR: Conformer generation failed for all queries. Exiting.")
+            sys.exit(1)
 
-    if not query_mols:
-        print("ERROR: No valid query molecules found. Exiting.")
-        sys.exit(1)
+        print(f"  {len(query_mols)} query molecule(s) with conformers ready")
 
-    n_unique = len(set(query_name_to_uid.values()))
-    print(f"  Loaded {len(query_mols)} query molecule(s), {n_unique} unique UID(s)")
-
-    # Generate conformers for all queries in GPU chunks
-    # (SDF queries already have one conformer but benefit from additional ones;
-    #  SMILES queries have zero conformers and require this step.)
-    print(f"  Generating {args.query_confs} conformer(s) per query...")
-    query_mols = embed_and_optimize(
-        query_mols, n_confs=args.query_confs,
-        hardware_options=hardware_options, mmff_max_iters=args.mmff_max_iters,
-        chunk_size=args.embed_chunk_size,
-    )
-    if not query_mols:
-        print("ERROR: Conformer generation failed for all queries. Exiting.")
-        sys.exit(1)
-
-    print(f"  {len(query_mols)} query molecule(s) with conformers ready")
+        if args.conf_cache:
+            save_conf_cache(args.conf_cache, query_mols, query_name_to_uid)
 
     # ── 2. Build the list of reference datasets ────────────────────
     # Either from --datasets JSON or from the individual flags.
